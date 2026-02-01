@@ -1,390 +1,327 @@
-import dlt
-import logging
-from typing import Dict, List, Any, Iterator, Optional, Callable
-from datetime import datetime, timezone
-from .api_service import APIService
-from loki_logger import get_logger, log_business_event, log_security_event
-from .api_service import APIService
+"""
+HubSpot Deals DLT Data Source
 
-def create_data_source(
-    job_config: Dict[str, Any],
-    auth_config: Dict[str, Any],
-    filters: Dict[str, Any],
-    checkpoint_callback: Optional[Callable] = None,
-    check_cancel_callback: Optional[Callable] = None,
-    check_pause_callback: Optional[Callable] = None,  # Add pause callback parameter
-    resume_from: Optional[Dict[str, Any]] = None,
+This module implements the DLT data source for extracting HubSpot deals.
+"""
+
+import dlt
+from typing import Iterator, Dict, Any, Optional, List
+from datetime import datetime, timezone
+import logging
+
+from services.api_service import HubSpotAPIService, HubSpotAPIError
+
+logger = logging.getLogger(__name__)
+
+
+def transform_deal(deal: Dict[str, Any], 
+                   tenant_id: str, 
+                   scan_id: str,
+                   extracted_at: datetime) -> Dict[str, Any]:
+    """
+    Transform HubSpot deal to database format
+    
+    Args:
+        deal: Raw deal object from HubSpot API
+        tenant_id: Tenant identifier
+        scan_id: Scan batch identifier
+        extracted_at: Extraction timestamp
+        
+    Returns:
+        Transformed deal record
+    """
+    properties = deal.get("properties", {})
+    
+    # Helper function to safely get numeric values
+    def get_numeric(value):
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+    
+    # Helper function to safely get boolean values
+    def get_boolean(value):
+        if value is None or value == "":
+            return None
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() == "true"
+    
+    # Helper function to safely get datetime values
+    def get_datetime(value):
+        if value is None or value == "":
+            return None
+        try:
+            # HubSpot returns ISO 8601 format
+            return value
+        except:
+            return None
+    
+    # Build transformed record
+    transformed = {
+        # Primary identifiers
+        "deal_id": deal.get("id"),
+        "hs_object_id": deal.get("id"),
+        
+        # Core deal information
+        "deal_name": properties.get("dealname"),
+        "amount": get_numeric(properties.get("amount")),
+        "currency": properties.get("deal_currency_code", "USD"),
+        "dealstage": properties.get("dealstage"),
+        "dealtype": properties.get("dealtype"),
+        "pipeline": properties.get("pipeline"),
+        "description": properties.get("description"),
+        
+        # Owner & Assignment
+        "owner_id": properties.get("hubspot_owner_id"),
+        "hubspot_owner_id": properties.get("hubspot_owner_id"),
+        
+        # Deal Metrics
+        "num_associated_contacts": int(properties.get("num_associated_contacts", 0) or 0),
+        "num_associated_companies": int(properties.get("num_associated_companies", 0) or 0),
+        "hs_forecast_amount": get_numeric(properties.get("hs_forecast_amount")),
+        "hs_forecast_probability": get_numeric(properties.get("hs_forecast_probability")),
+        
+        # Status Flags
+        "is_archived": deal.get("archived", False),
+        "archived": deal.get("archived", False),
+        "hs_is_closed_won": get_boolean(properties.get("hs_is_closed_won")),
+        "hs_is_closed_lost": get_boolean(properties.get("hs_is_closed_lost")),
+        
+        # Priority
+        "hs_priority": properties.get("hs_priority"),
+        
+        # Dates & Timestamps
+        "close_date": get_datetime(properties.get("closedate")),
+        "createdate": get_datetime(properties.get("createdate")),
+        "hs_lastmodifieddate": get_datetime(properties.get("hs_lastmodifieddate")),
+        "created_at": deal.get("createdAt"),
+        "updated_at": deal.get("updatedAt"),
+        
+        # Raw data storage
+        "raw_properties": properties,
+        
+        # ETL Metadata (CRITICAL)
+        "extracted_at": extracted_at.isoformat(),
+        "_tenant_id": tenant_id,
+        "_extracted_at": extracted_at.isoformat(),
+        "_scan_id": scan_id,
+        "_source_system": "hubspot",
+        "_api_version": "v3",
+        "_is_deleted": False,
+    }
+    
+    return transformed
+
+
+@dlt.resource(
+    name="deals",
+    write_disposition="merge",
+    primary_key="deal_id",
+    merge_key="deal_id"
+)
+def extract_deals(
+    access_token: str,
+    tenant_id: str,
+    scan_id: str,
+    properties: Optional[List[str]] = None,
+    archived: bool = False,
+    batch_size: int = 100,
+    checkpoint_interval: int = 50
+) -> Iterator[Dict[str, Any]]:
+    """
+    DLT resource for extracting HubSpot deals
+    
+    Args:
+        access_token: HubSpot Private App access token
+        tenant_id: Tenant/organization identifier
+        scan_id: Unique scan batch identifier
+        properties: List of deal properties to extract
+        archived: Whether to include archived deals
+        batch_size: Number of deals per API request
+        checkpoint_interval: Save checkpoint every N deals
+        
+    Yields:
+        Transformed deal records
+    """
+    logger.info(f"Starting deals extraction - Tenant: {tenant_id}, Scan: {scan_id}")
+    
+    # Initialize API service
+    service = HubSpotAPIService(access_token)
+    
+    # Verify credentials
+    if not service.verify_credentials():
+        raise HubSpotAPIError("Invalid HubSpot credentials")
+    
+    # Extraction metadata
+    extracted_at = datetime.now(timezone.utc)
+    after_cursor = None
+    page = 1
+    total_deals = 0
+    
+    try:
+        while True:
+            logger.info(f"Fetching page {page} (batch size: {batch_size})")
+            
+            # Get deals from HubSpot
+            data = service.get_deals(
+                limit=batch_size,
+                after=after_cursor,
+                properties=properties,
+                archived=archived
+            )
+            
+            results = data.get("results", [])
+            
+            if not results:
+                logger.info("No more deals to extract")
+                break
+            
+            # Transform and yield deals
+            for deal in results:
+                transformed = transform_deal(
+                    deal=deal,
+                    tenant_id=tenant_id,
+                    scan_id=scan_id,
+                    extracted_at=extracted_at
+                )
+                
+                total_deals += 1
+                
+                # Yield transformed deal
+                yield transformed
+                
+                # Checkpoint logging
+                if total_deals % checkpoint_interval == 0:
+                    logger.info(f"Checkpoint: {total_deals} deals extracted")
+            
+            logger.info(f"Page {page}: Extracted {len(results)} deals. Total: {total_deals}")
+            
+            # Check for more pages
+            paging = data.get("paging", {})
+            if "next" not in paging:
+                logger.info(f"✅ Extraction complete. Total deals: {total_deals}")
+                break
+            
+            # Get next page cursor
+            after_cursor = paging["next"]["after"]
+            page += 1
+            
+    except HubSpotAPIError as e:
+        logger.error(f"HubSpot API error during extraction: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during extraction: {e}", exc_info=True)
+        raise
+    finally:
+        service.close()
+        logger.info(f"Extraction session closed. Extracted {total_deals} deals")
+
+
+@dlt.source
+def hubspot_deals_source(
+    access_token: str,
+    tenant_id: str = "default",
+    scan_id: Optional[str] = None,
+    properties: Optional[List[str]] = None,
+    archived: bool = False,
+    batch_size: int = 100
 ):
     """
-    Create DLT source function for Hubspot_Deals data extraction with checkpoint support
+    DLT source for HubSpot deals extraction
+    
+    Args:
+        access_token: HubSpot Private App access token
+        tenant_id: Tenant/organization identifier
+        scan_id: Unique scan batch identifier
+        properties: List of deal properties to extract
+        archived: Whether to include archived deals
+        batch_size: Number of deals per API request
+        
+    Returns:
+        DLT source with deals resource
     """
-    logger = get_logger(__name__)
-    api_service = APIService(base_url="https://api.hubapi.com" , test_delay_seconds=1)
-
-    access_token = auth_config.get("accessToken")
-    if not access_token:
-        raise ValueError("No access token found in auth configuration")
-
-    organization_id = job_config.get("organizationId")
-    if not organization_id:
-        raise ValueError("No organization ID found in job configuration")
-
-    #  To Be Removed Later
-    logger.info(
-        "Starting Hubspot_Deals data extraction",
-        extra={
-            "organization_id": organization_id,
-            "filters": filters,
-            "auth_config": auth_config,
-            "job_config": job_config,
-        },
+    # Generate scan_id if not provided
+    if not scan_id:
+        scan_id = f"scan_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    
+    logger.info(f"Initializing HubSpot Deals source - Scan ID: {scan_id}")
+    
+    # Default properties if not specified
+    if not properties:
+        properties = [
+            "dealname",
+            "amount",
+            "dealstage",
+            "dealtype",
+            "pipeline",
+            "closedate",
+            "createdate",
+            "hs_lastmodifieddate",
+            "hubspot_owner_id",
+            "deal_currency_code",
+            "num_associated_contacts",
+            "num_associated_companies",
+            "hs_forecast_amount",
+            "hs_forecast_probability",
+            "hs_is_closed_won",
+            "hs_is_closed_lost",
+            "hs_priority",
+            "description"
+        ]
+    
+    return extract_deals(
+        access_token=access_token,
+        tenant_id=tenant_id,
+        scan_id=scan_id,
+        properties=properties,
+        archived=archived,
+        batch_size=batch_size
     )
 
-    @dlt.resource(name="hubspot_deals", write_disposition="replace", primary_key="id")
-    def get_main_data() -> Iterator[Dict[str, Any]]:
-        """
-        Extract main data from Hubspot_Deals API with checkpoint support
 
-        TODO: Customize for Hubspot_Deals:
-        - Update resource name and primary_key
-        - Adjust API calls and pagination
-        - Modify data transformation logic
-        """
-
-        # Initialize state
-        if resume_from:
-            after = resume_from.get("cursor")
-            page_count = resume_from.get("page_number", 0)
-            total_records = resume_from.get("records_processed", 0)
-            logger.info(
-                "Resuming data extraction",
-                extra={
-                    "operation": "data_extraction",
-                    "page_number": page_count + 1,
-                    "total_processed": total_records,
-                },
+# Convenience function for testing
+def test_extraction(access_token: str, 
+                   tenant_id: str = "test", 
+                   limit: int = 10) -> List[Dict[str, Any]]:
+    """
+    Test extraction without DLT pipeline
+    
+    Args:
+        access_token: HubSpot access token
+        tenant_id: Tenant identifier
+        limit: Maximum number of deals to extract
+        
+    Returns:
+        List of extracted deals
+    """
+    logger.info(f"Starting test extraction (limit: {limit})")
+    
+    scan_id = f"test_scan_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+    extracted_at = datetime.now(timezone.utc)
+    
+    service = HubSpotAPIService(access_token)
+    
+    try:
+        # Get deals
+        data = service.get_deals(limit=limit)
+        results = data.get("results", [])
+        
+        # Transform deals
+        transformed_deals = []
+        for deal in results:
+            transformed = transform_deal(
+                deal=deal,
+                tenant_id=tenant_id,
+                scan_id=scan_id,
+                extracted_at=extracted_at
             )
-        else:
-            after = None
-            page_count = 0
-            total_records = 0
-            logger.info(
-                "Starting fresh data extraction",
-                extra={"operation": "data_extraction", "source": "hubspot_deals"},
-            )
-
-        # Configuration
-        checkpoint_interval = 10
-        cancel_check_interval = 1
-        pause_check_interval = 1  # Check for pause more frequently than cancel
-        job_id = filters.get("scan_id", "unknown")
-
-        while page_count < 1000:  # Safety limit
-            try:
-                # Check for cancellation
-                if page_count % cancel_check_interval == 0:
-                    if check_cancel_callback and check_cancel_callback(job_id):
-                        logger.info(
-                            "Extraction cancelled by user",
-                            extra={
-                                "operation": "data_extraction",
-                                "job_id": job_id,
-                                "page_number": page_count + 1,
-                                "total_processed": total_records,
-                            },
-                        )
-
-                        # Save cancellation checkpoint
-                        if checkpoint_callback:
-                            try:
-                                cancel_checkpoint = {
-                                    "phase": "main_data_cancelled",
-                                    "records_processed": total_records,
-                                    "cursor": after,
-                                    "page_number": page_count,
-                                    "batch_size": 100,
-                                    "checkpoint_data": {
-                                        "cancellation_reason": "user_requested",
-                                        "cancelled_at_page": page_count,
-                                        "service": "hubspot_deals",
-                                    },
-                                }
-                                checkpoint_callback(job_id, cancel_checkpoint)
-                            except Exception as e:
-                                logger.warning(
-                                    "Failed to save cancellation checkpoint",
-                                    extra={"job_id": job_id, "error": str(e)},
-                                )
-                        break
-
-                # Check for pause request
-                if page_count % pause_check_interval == 0:
-                    if check_pause_callback and check_pause_callback(job_id):
-                        logger.info(
-                            "Extraction paused by user",
-                            extra={
-                                "operation": "data_extraction",
-                                "job_id": job_id,
-                                "page_number": page_count + 1,
-                                "total_processed": total_records,
-                            },
-                        )
-
-                        # Save pause checkpoint - this allows resuming from exact position
-                        if checkpoint_callback:
-                            try:
-                                pause_checkpoint = {
-                                    "phase": "main_data_paused",
-                                    "records_processed": total_records,
-                                    "cursor": after,
-                                    "page_number": page_count,
-                                    "batch_size": 1,
-                                    "checkpoint_data": {
-                                        "pause_reason": "user_requested",
-                                        "paused_at_page": page_count,
-                                        "paused_at": datetime.now(
-                                            timezone.utc
-                                        ).isoformat(),
-                                        "service": "hubspot_deals",
-                                    },
-                                }
-                                checkpoint_callback(job_id, pause_checkpoint)
-
-                                logger.info(
-                                    "Pause checkpoint saved",
-                                    extra={
-                                        "operation": "data_extraction",
-                                        "job_id": job_id,
-                                        "page_number": page_count,
-                                        "total_processed": total_records,
-                                    },
-                                )
-                            except Exception as e:
-                                logger.warning(
-                                    "Failed to save pause checkpoint",
-                                    extra={"job_id": job_id, "error": str(e)},
-                                )
-
-                        # Exit gracefully - this allows the job to be resumed later
-                        break
-
-                logger.debug(
-                    "Fetching data page",
-                    extra={
-                        "operation": "data_extraction",
-                        "job_id": job_id,
-                        "page_number": page_count + 1,
-                    },
-                )
-
-                # TODO: Replace with appropriate Hubspot_Deals API call
-                data = api_service.get_data(
-                    access_token=access_token, limit=1, after=after,
-                )
-
-                page_records = 0
-
-                # TODO: Update data processing based on Hubspot_Deals response structure
-                data_key = "results"  # Update based on API response
-                if data_key in data and data[data_key]:
-                    for record in data[data_key]:
-                        # Check for pause/cancel even within record processing for faster response
-                        if check_pause_callback and check_pause_callback(job_id):
-                            logger.info(
-                                "Extraction paused mid-page",
-                                extra={
-                                    "operation": "data_extraction",
-                                    "job_id": job_id,
-                                    "page_number": page_count + 1,
-                                    "records_in_page": page_records,
-                                    "total_processed": total_records + page_records,
-                                },
-                            )
-
-                            # Save mid-page pause checkpoint
-                            if checkpoint_callback:
-                                try:
-                                    mid_page_checkpoint = {
-                                        "phase": "main_data_paused_mid_page",
-                                        "records_processed": total_records
-                                        + page_records,
-                                        "cursor": after,
-                                        "page_number": page_count,
-                                        "batch_size": 100,
-                                        "checkpoint_data": {
-                                            "pause_reason": "user_requested_mid_page",
-                                            "paused_at_page": page_count,
-                                            "records_completed_in_page": page_records,
-                                            "paused_at": datetime.now(
-                                                timezone.utc
-                                            ).isoformat(),
-                                            "service": "hubspot_deals",
-                                        },
-                                    }
-                                    checkpoint_callback(job_id, mid_page_checkpoint)
-                                except Exception as e:
-                                    logger.warning(
-                                        "Failed to save mid-page pause checkpoint",
-                                        extra={"job_id": job_id, "error": str(e)},
-                                    )
-                            return  # Exit the generator
-
-                        # Filter properties if specified
-                        if "properties" in filters and filters["properties"]:
-                            filtered_record = {
-                                prop: record.get(prop)
-                                for prop in filters["properties"]
-                                if prop in record
-                            }
-                            filtered_record["id"] = record.get("id")  # Always keep ID
-                        else:
-                            filtered_record = record
-
-                        # Add extraction metadata
-                        filtered_record.update(
-                            {
-                                "_extracted_at": datetime.now(timezone.utc).isoformat(),
-                                "_scan_id": filters.get("scan_id", "unknown"),
-                                "_organization_id": filters.get(
-                                    "organization_id", "unknown"
-                                ),
-                                "_page_number": page_count + 1,
-                                "_source_service": "hubspot_deals",
-                            }
-                        )
-
-                        yield filtered_record
-                        page_records += 1
-
-                # Update counters
-                total_records += page_records
-                page_count += 1
-
-                # Save checkpoint periodically
-                if checkpoint_callback and page_count % checkpoint_interval == 0:
-                    try:
-                        # TODO: Update pagination logic based on Hubspot_Deals API
-                        next_cursor = None
-                        if (
-                            data.get("paging")
-                            and data["paging"].get("next")
-                            and data["paging"]["next"].get("after")
-                        ):
-                            next_cursor = data["paging"]["next"]["after"]
-
-                        checkpoint_data = {
-                            "phase": "main_data",
-                            "records_processed": total_records,
-                            "cursor": next_cursor,
-                            "page_number": page_count,
-                            "batch_size": 100,
-                            "checkpoint_data": {
-                                "pages_processed": page_count,
-                                "last_page_records": page_records,
-                                "service": "hubspot_deals",
-                            },
-                        }
-
-                        checkpoint_callback(job_id, checkpoint_data)
-
-                        logger.debug(
-                            "Checkpoint saved",
-                            extra={
-                                "operation": "data_extraction",
-                                "job_id": job_id,
-                                "page_number": page_count,
-                                "total_records": total_records,
-                            },
-                        )
-
-                    except Exception as checkpoint_error:
-                        logger.warning(
-                            "Failed to save checkpoint",
-                            extra={
-                                "operation": "data_extraction",
-                                "job_id": job_id,
-                                "error": str(checkpoint_error),
-                            },
-                        )
-
-                # TODO: Handle pagination based on Hubspot_Deals API response
-                if (
-                    data.get("paging")
-                    and data["paging"].get("next")
-                    and data["paging"]["next"].get("after")
-                ):
-                    after = data["paging"]["next"]["after"]
-                elif data.get("has_more"):
-                    after = data.get("next_cursor")
-                elif data.get("next_page_token"):
-                    after = data.get("next_page_token")
-                else:
-                    # Final checkpoint on completion
-                    if checkpoint_callback:
-                        try:
-                            final_checkpoint = {
-                                "phase": "main_data_completed",
-                                "records_processed": total_records,
-                                "cursor": None,
-                                "page_number": page_count,
-                                "batch_size": 100,
-                                "checkpoint_data": {
-                                    "completion_status": "success",
-                                    "total_pages": page_count,
-                                    "final_total": total_records,
-                                    "service": "hubspot_deals",
-                                },
-                            }
-                            checkpoint_callback(job_id, final_checkpoint)
-                        except Exception as e:
-                            logger.warning(
-                                "Failed to save final checkpoint",
-                                extra={"job_id": job_id, "error": str(e)},
-                            )
-
-                    logger.info(
-                        "Data extraction completed",
-                        extra={
-                            "operation": "data_extraction",
-                            "job_id": job_id,
-                            "total_records": total_records,
-                            "total_pages": page_count,
-                        },
-                    )
-                    break
-
-            except Exception as e:
-                logger.error(
-                    "Error fetching data page",
-                    extra={
-                        "operation": "data_extraction",
-                        "job_id": job_id,
-                        "page_number": page_count + 1,
-                        "error": str(e),
-                    },
-                    exc_info=True,
-                )
-
-                # Save error checkpoint for debugging
-                if checkpoint_callback:
-                    try:
-                        error_checkpoint = {
-                            "phase": "main_data_error",
-                            "records_processed": total_records,
-                            "cursor": after,
-                            "page_number": page_count,
-                            "batch_size": 100,
-                            "checkpoint_data": {
-                                "error": str(e),
-                                "error_page": page_count + 1,
-                                "recovery_cursor": after,
-                                "service": "hubspot_deals",
-                            },
-                        }
-                        checkpoint_callback(job_id, error_checkpoint)
-                    except:
-                        pass
-
-                raise e
-
-    return [get_main_data]
+            transformed_deals.append(transformed)
+        
+        logger.info(f"✅ Test extraction complete: {len(transformed_deals)} deals")
+        return transformed_deals
+        
+    finally:
+        service.close()
